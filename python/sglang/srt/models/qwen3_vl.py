@@ -470,7 +470,89 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
+
         x = self.merger(x)
+
+        
+        #### softprune ####
+        '''
+        keep_ratio = 0.8
+        
+        with torch.no_grad():
+            # 现在 x 的形状是 [N_merged, Hidden_Size] (例如 64)
+            # 这里的 N_merged 和 deepstack 的长度是一致的
+            feat = x  # x 已经被 merger 挤压过 squeeze(1) 了吗？
+            # Qwen3 的 merger 输出通常是 [seq_len, hidden_size]
+            # 让我们确认一下形状，如果维度不对可能需要 squeeze
+            if feat.dim() == 3 and feat.shape[1] == 1:
+                feat = feat.squeeze(1)
+
+            # 归一化 + 自相关计算
+            feat_norm = feat / (feat.norm(dim=-1, keepdim=True) + 1e-6)
+            sim_matrix = torch.matmul(feat_norm, feat_norm.t())
+            scores = sim_matrix.mean(dim=0) # [N_merged]
+            
+            # 选 Top-K
+            num_tokens = scores.shape[0]
+            k = int(num_tokens * keep_ratio)
+            k = max(k, 1)
+            
+            _, topk_indices = torch.topk(scores, k=k, sorted=False)
+            
+            mask = torch.zeros(num_tokens, dtype=torch.bool, device=x.device)
+            mask[topk_indices] = True
+            
+            # if self.pp_group.is_first_rank:
+            #     print(f"DEBUG: Soft Pruning - Keeping {k}/{num_tokens} tokens (Merged Level).")
+
+        # --- 应用软剪枝 ---
+        # 1. 对主特征置零 (x 已经是 merged 后的形状)
+        # 确保 mask 维度匹配
+        if x.dim() == 3: # [N, 1, D]
+             mask_expanded = mask.view(-1, 1, 1)
+        else:            # [N, D]
+             mask_expanded = mask.view(-1, 1)
+
+        x = x * mask_expanded.to(x.dtype)
+
+        # 2. 对 Deepstack 特征同步置零
+        # 现在 mask 长度是 64，deepstack 也是 64，完美匹配
+        deepstack_mask = mask.view(-1, 1)
+        
+        for i in range(len(deepstack_feature_lists)):
+             deepstack_feature_lists[i] = deepstack_feature_lists[i] * deepstack_mask.to(deepstack_feature_lists[i].dtype)
+        logger.info("#######soft prune 0.8 done########")
+        # soft prune done
+        '''
+
+
+        # hard prune start
+        keep_ratio = 0.8
+        
+        with torch.no_grad():
+            # 确保 x 形状为 [N, Hidden]
+            feat = x.squeeze(1) if x.dim() == 3 else x
+            
+            # 2. 算分 (使用你验证过的自相关方法)
+            feat_norm = feat / (feat.norm(dim=-1, keepdim=True) + 1e-6)
+            sim_matrix = torch.matmul(feat_norm, feat_norm.t())
+            scores = sim_matrix.mean(dim=0)
+            
+            # 3. 选 Top-K 并物理切片
+            k = max(int(scores.shape[0] * keep_ratio), 1)
+            _, topk_indices = torch.topk(scores, k=k, sorted=False)
+            topk_indices, _ = torch.sort(topk_indices) # 保持空间顺序对RoPE友好
+            
+            # 4. 物理删除 Token (Hard Pruning)
+            x = x[topk_indices]
+            
+            # 5. 同步切片 Deepstack 特征
+            for i in range(len(deepstack_feature_lists)):
+                deepstack_feature_lists[i] = deepstack_feature_lists[i][topk_indices]
+        # hard prune done
+
+
+
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
@@ -748,6 +830,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    '''
+    #origin
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
@@ -851,6 +935,104 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         # concatenate back the full image embedding sequence
         return torch.cat(all_chunk_embeds, dim=0)
+    '''
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # 1. 基础数据准备
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        
+        # 预先计算每个 Image 对应的原始预期 Token 数量 (降采样后)
+        # Qwen3-VL 逻辑: (H//2) * (W//2) * T
+        grid_thw_list = image_grid_thw.tolist()
+        expected_lens = []
+        for t, h, w in grid_thw_list:
+            expected_lens.append((h // 2) * (w // 2) * t)
+        total_expected_len = sum(expected_lens)
+
+        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
+        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
+
+        # --- 情况 A: 非分块模式 ---
+        if max_patches_per_call == 0 and max_images_per_call == 0:
+            if self.use_data_parallel:
+                image_embeds = run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values,
+                    image_grid_thw.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+            
+            # 执行 Padding 对齐
+            return self._pad_to_expected_len(image_embeds, total_expected_len)
+
+        # --- 情况 B: 分块模式 (Chunked Call) ---
+        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
+        num_images = len(patches_per_image)
+        cum_patches = [0]
+        for p in patches_per_image:
+            cum_patches.append(cum_patches[-1] + p)
+
+        all_chunk_embeds: List[torch.Tensor] = []
+        img_start = 0
+
+        while img_start < num_images:
+            img_end = img_start
+            patches_in_chunk = 0
+            while img_end < num_images:
+                next_patches = patches_per_image[img_end]
+                if max_patches_per_call > 0 and patches_in_chunk + next_patches > max_patches_per_call:
+                    break
+                if max_images_per_call > 0 and (img_end - img_start) + 1 > max_images_per_call:
+                    break
+                patches_in_chunk += next_patches
+                img_end += 1
+
+            if img_end == img_start:
+                img_end = img_start + 1
+
+            pixel_chunk = pixel_values[cum_patches[img_start]:cum_patches[img_end]]
+            grid_chunk = image_grid_thw[img_start:img_end]
+
+            if self.use_data_parallel:
+                chunk_embeds = run_dp_sharded_mrope_vision_model(
+                    self.visual, pixel_chunk, grid_chunk.tolist(), rope_type="rope_3d",
+                )
+            else:
+                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
+
+            all_chunk_embeds.append(chunk_embeds)
+            img_start = img_end
+
+        # 拼接所有分块
+        combined_embeds = torch.cat(all_chunk_embeds, dim=0)
+        
+        # 执行 Padding 对齐
+        return self._pad_to_expected_len(combined_embeds, total_expected_len)
+
+    def _pad_to_expected_len(self, embeds: torch.Tensor, expected_len: int) -> torch.Tensor:
+        """辅助函数：将剪枝后的 Embedding 补齐到占位符长度"""
+        actual_len = embeds.shape[0]
+        
+        if actual_len < expected_len:
+            padding_len = expected_len - actual_len
+            # 使用全 0 填充 (或者可以使用 embeds[-1:].repeat(padding_len, 1) 使用最后一个 token 填充)
+            padding = torch.zeros(
+                (padding_len, embeds.shape[1]),
+                dtype=embeds.dtype,
+                device=embeds.device
+            )
+            return torch.cat([embeds, padding], dim=0)
+        elif actual_len > expected_len:
+            # 防止意外超出长度
+            return embeds[:expected_len]
+        
+        return embeds
+
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         for item in items:
